@@ -65,8 +65,7 @@ use Cwd            qw( abs_path );
 use File::Basename qw( dirname );
 
 
-
-require 'eds-methods.pl';
+my $PluginDir = C4::Context->config("pluginsdir");$PluginDir = $PluginDir.'/Koha/Plugin/EDS';require $PluginDir.'/opac/eds-methods.pl';
 our $apiType = 'publication';
 
 my $pluginsdir = C4::Context->config("pluginsdir");

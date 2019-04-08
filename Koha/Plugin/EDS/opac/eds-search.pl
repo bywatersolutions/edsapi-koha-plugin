@@ -65,7 +65,6 @@ use Cwd            qw( abs_path );
 use File::Basename qw( dirname );
 
 
-require 'eds-methods.pl';
 
 #my $PluginDir = dirname(abs_path($0));
 #$PluginDir =~s /EDS\/opac/EDS/;
@@ -74,6 +73,7 @@ require 'eds-methods.pl';
 #FIXME below should be adjusted to handle multiple directories
 my $PluginDir = C4::Context->config("pluginsdir");
 $PluginDir = $PluginDir.'/Koha/Plugin/EDS';
+require $PluginDir . '/opac/eds-methods.pl';
 $PluginDir = $PluginDir.'/'.C4::Context->preference('opacthemes');
 
 my $cgi = new CGI;

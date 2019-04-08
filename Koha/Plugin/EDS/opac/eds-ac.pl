@@ -5,7 +5,7 @@ use warnings;
 use LWP::Simple;
 use CGI;
 
-require 'eds-methods.pl';
+my $PluginDir = C4::Context->config("pluginsdir");$PluginDir = $PluginDir.'/Koha/Plugin/EDS';require $PluginDir.'/opac/eds-methods.pl';
 
 print "Content-type: text/html\n\n";
 

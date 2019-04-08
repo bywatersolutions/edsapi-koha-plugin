@@ -47,17 +47,16 @@ use Try::Tiny;
 my $input = new CGI;
 my $dbh   = C4::Context->dbh;
 
-require 'eds-methods.pl';
+my $pluginsdir = C4::Context->config("pluginsdir");
+my @pluginsdir = ref($pluginsdir) eq 'ARRAY' ? @$pluginsdir : $pluginsdir;
+my ($PluginDir) = grep { -f $_ . "/Koha/Plugin/EDS.pm" } @pluginsdir;
+require $PluginDir . '/Koha/Plugin/EDS/opac/eds-methods.pl';
+$PluginDir = $PluginDir . '/Koha/Plugin/EDS/' . C4::Context->preference('opacthemes');
+
 if($input->param("api") eq 'pub'){our $apiType="publication";}
 my $EDSConfig = decode_json(EDSGetConfiguration());
 #{if($EDSConfig->{logerrors} eq 'no'){no warnings;local $^W = 0;}
 {no warnings;local $^W = 0;
-
-
-my $pluginsdir = C4::Context->config("pluginsdir");
-my @pluginsdir = ref($pluginsdir) eq 'ARRAY' ? @$pluginsdir : $pluginsdir;
-my ($PluginDir) = grep { -f $_ . "/Koha/Plugin/EDS.pm" } @pluginsdir;
-$PluginDir = $PluginDir . '/Koha/Plugin/EDS/' . C4::Context->preference('opacthemes');
 
 my ( $template, $borrowernumber, $cookie ) = get_template_and_user(
     {

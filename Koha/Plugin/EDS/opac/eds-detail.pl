@@ -46,7 +46,7 @@ use POSIX qw/ceil/;
 use Cwd            qw( abs_path );
 use File::Basename qw( dirname );
 
-require 'eds-methods.pl';
+my $PluginDir = C4::Context->config("pluginsdir");$PluginDir = $PluginDir.'/Koha/Plugin/EDS';require $PluginDir.'/opac/eds-methods.pl';
 
 my $EDSConfig = decode_json(EDSGetConfiguration());
 {no warnings;local $^W = 0;
