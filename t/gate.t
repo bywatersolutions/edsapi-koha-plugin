@@ -18,7 +18,8 @@
 use Modern::Perl;
 
 use Test::NoWarnings;
-use Test::More tests => 7;
+use Test::More tests => 8;
+use Test::MockModule;
 
 use FindBin qw( $Bin );
 use lib "$Bin/lib";
@@ -35,6 +36,16 @@ my %browser   = ( CGISESSID => $anonymous->id, sessionToken => 'browser-token', 
 my %page      = EDSTest::PAGE_HEADERS;
 my %xhr       = EDSTest::XHR_HEADERS;
 my $search    = 'q=Search?query-1=AND,history';
+
+# The memcached the gate keeps its counters in
+sub gate_counters {
+    return Cache::Memcached::Fast->new(
+        {
+            servers   => [ split /\s*,\s*/, C4::Context->config('memcached_servers') ],
+            namespace => C4::Context->config('memcached_namespace') . ':eds_gate:',
+        }
+    );
+}
 
 # A response the gate wrote itself, without loading Koha or calling EBSCO
 sub refused_early {
@@ -127,16 +138,11 @@ subtest 'staff utilities' => sub {
 subtest 'rate limits' => sub {
     plan tests => 8;
 
-    my $memcached = Cache::Memcached::Fast->new(
-        {
-            servers   => [ split /\s*,\s*/, C4::Context->config('memcached_servers') ],
-            namespace => C4::Context->config('memcached_namespace') . ':eds_gate:',
-        }
-    );
-    my $visitor  = "gatetest$$";
-    my $staff_ip = '192.0.2.1';
-    my @keys     = ( "page:$visitor", "json:$visitor", "staff:$staff_ip" );
-    my $cleanup  = EDSTest::Guard->new( sub { $memcached->delete($_) for @keys } );
+    my $memcached = gate_counters();
+    my $visitor   = "gatetest$$";
+    my $staff_ip  = '192.0.2.1';
+    my @keys      = ( "page:$visitor", "json:$visitor", "staff:$staff_ip" );
+    my $cleanup   = EDSTest::Guard->new( sub { $memcached->delete($_) for @keys } );
 
     # Spend each budget up to its limit, so the next request is the first one over it
     $memcached->set( "page:$visitor",   30,  60 );
@@ -165,6 +171,86 @@ subtest 'rate limits' => sub {
 
     $response = EDSTest::run_script( 'eds-raw.pl', { query => $search, cookies => \%browser, headers => \%xhr } );
     is( $response->{status}, 200, 'Other visitors are not affected' );
+};
+
+subtest 'bot guard' => sub {
+    plan skip_all => 'This Koha has no bot guard' unless eval { require Koha::Middleware::BotGuard; 1 };
+    plan tests    => 11;
+
+    # Trust cookies signed with the secret the koha-conf.xml copies below carry
+    my $secret       = 'eds-gate-test-secret';
+    my $trust_cookie = Test::MockModule->new('Koha::BotGuard::TrustCookie');
+    $trust_cookie->mock( secret => $secret );
+    my $anonymous_trust     = Koha::BotGuard::TrustCookie->issue('anonymous');
+    my $authenticated_trust = Koha::BotGuard::TrustCookie->issue('authenticated');
+    my $nonce               = ( split /\./, $anonymous_trust )[2];
+
+    my $koha_conf_with = sub {
+        my ($settings) = @_;
+        my $config = EDSTest::slurp( $ENV{KOHA_CONF} );
+
+        # Into the main <config>, the last one, not a Zebra server's
+        $config =~ s{(.*)</config>}{$1<opac_bot_guard>$settings<secret>$secret</secret></opac_bot_guard>\n</config>}s;
+        my ( $fh, $file ) = tempfile( UNLINK => 1 );
+        binmode $fh, ':encoding(UTF-8)';
+        print {$fh} $config;
+        close $fh;
+        return $file;
+    };
+    my $enforce = $koha_conf_with->('<enabled>1</enabled><mode>enforce</mode>');
+    my $observe = $koha_conf_with->('<enabled>1</enabled><mode>observe</mode>');
+    my $exempt  = $koha_conf_with->('<enabled>1</enabled><mode>enforce</mode><exempt_ips>127.0.0.0/8</exempt_ips>');
+
+    my %results = ( query => $search, headers => \%page, koha_conf => $enforce );
+    my %json    = ( query => $search, headers => \%xhr,  koha_conf => $enforce );
+
+    my $response = EDSTest::run_script( 'eds-search.pl', { %results, cookies => \%browser } );
+    is(
+        $response->{headers}->{'x-koha-botguard'}->[0], 'challenge',
+        'A page view without the trust cookie gets the bot guard challenge'
+    );
+    ok( refused_early($response), '... before Koha or EBSCO' );
+
+    $response = EDSTest::run_script( 'eds-raw.pl', { %json, cookies => \%browser } );
+    is( $response->{status}, 403, 'A JSON call without the trust cookie is refused' );
+    ok( refused_early($response), '... before Koha or EBSCO' );
+
+    $response =
+        EDSTest::run_script( 'eds-search.pl', { %results, cookies => { %browser, KOHA_TRUST => $anonymous_trust } } );
+    like( $response->{body}, qr/TEMPLATE FILE: eds-results\.tt/, 'With the trust cookie the page is shown' );
+
+    $response = EDSTest::run_script( 'eds-raw.pl', { %json, cookies => { %browser, KOHA_TRUST => $anonymous_trust } } );
+    is( $response->{status}, 200, 'With the trust cookie the JSON call is answered' );
+
+    my $memcached = gate_counters();
+    my $cleanup   = EDSTest::Guard->new( sub { $memcached->delete("page:$nonce") } );
+    $memcached->set( "page:$nonce", 30, 60 );
+    $response = EDSTest::run_script(
+        'eds-search.pl',
+        { %results, cookies => { CGISESSID => 'another-session', KOHA_TRUST => $anonymous_trust } }
+    );
+    is( $response->{status}, 429, 'The page budget follows the trust cookie, not the session' );
+
+    $response = EDSTest::run_script(
+        'eds-search.pl',
+        { %results, cookies => { %browser, KOHA_TRUST => $authenticated_trust } }
+    );
+    like(
+        $response->{body}, qr/TEMPLATE FILE: eds-results\.tt/,
+        'A logged in patron\'s trust cookie gets the page'
+    );
+
+    $response = EDSTest::run_script( 'eds-search.pl', { %results, cookies => \%browser, koha_conf => $observe } );
+    like( $response->{body}, qr/TEMPLATE FILE: eds-results\.tt/, 'In observe mode the page is shown anyway' );
+
+    $response = EDSTest::run_script( 'eds-search.pl', { %results, cookies => \%browser, koha_conf => $exempt } );
+    like( $response->{body}, qr/TEMPLATE FILE: eds-results\.tt/, 'An exempt address is not challenged' );
+
+    $response = EDSTest::run_script( 'eds-search.pl', { query => $search, headers => \%page, cookies => \%browser } );
+    like(
+        $response->{body}, qr/TEMPLATE FILE: eds-results\.tt/,
+        'Without opac_bot_guard in koha-conf.xml nothing changes'
+    );
 };
 
 subtest 'without memcached' => sub {

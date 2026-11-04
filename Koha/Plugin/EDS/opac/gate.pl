@@ -6,6 +6,7 @@ package Koha::Plugin::EDS::OpacGate;
 
 use strict;
 use warnings;
+use feature qw( state );
 
 use constant PAGE_LIMIT => 30;     # page views per visitor per minute
 use constant JSON_LIMIT => 120;    # the basket fetches one record per call
@@ -35,6 +36,32 @@ if ( $script eq 'eds-raw.pl' && $query =~ /(?:^|&)q=(?:getip|info)(?:&|$)/ ) {
 }
 
 my ($visitor) = grep { defined && length } @cookie{qw( CGISESSID EDS_COOKIE_CHECK )};
+
+# Where Koha's bot guard is on, these need the same trust cookie as opac-search.pl
+if ( my $guard = bot_guard() ) {
+    unless ( $guard->is_exempt_ip( $ENV{REMOTE_ADDR} ) ) {
+        my $trust = Koha::BotGuard::TrustCookie->verify( $guard->cookie_value( \%ENV ) );
+        return 1 if $trust && $trust->{kind} eq 'authenticated';
+
+        if ($trust) {
+
+            # One budget per trust cookie, however many sessions it is used with
+            $visitor = $trust->{nonce};
+        } else {
+            my $refusal = $guard->refuse(
+                { %ENV, PATH_INFO => $ENV{SCRIPT_NAME} },
+                'challenge', undef,
+                $kind eq 'page'
+                ? $guard->challenge_response
+                : [
+                    403, [ 'Content-Type' => 'application/json', 'Cache-Control' => 'no-store' ],
+                    ['{"error":"This is only available from the catalog."}']
+                ]
+            );
+            respond_psgi($refusal) if $refusal;
+        }
+    }
+}
 
 if ( $kind eq 'json' ) {
 
@@ -83,11 +110,7 @@ sub over_limit {
     ( $visitor = $visitor // $ENV{REMOTE_ADDR} // q{} ) =~ s/[^A-Za-z0-9.:_-]//g;
     return 0 unless length $visitor;
 
-    my $config = q{};
-    if ( $ENV{KOHA_CONF} && open my $fh, '<', $ENV{KOHA_CONF} ) {
-        $config = do { local $/; <$fh> };
-        close $fh;
-    }
+    my $config      = koha_conf();
     my ($servers)   = $config =~ m{<memcached_servers>\s*([^<]+?)\s*</memcached_servers>} or return 0;
     my ($namespace) = $config =~ m{<memcached_namespace>\s*([^<]*?)\s*</memcached_namespace>};
 
@@ -110,6 +133,67 @@ sub over_limit {
         $count = $memcached->incr($key);
     }
     return defined $count && $count > $limit ? 1 : 0;
+}
+
+=head2 koha_conf
+
+    my $config = koha_conf();
+
+The text of koha-conf.xml, read without loading Koha.
+
+=cut
+
+sub koha_conf {
+    state $config;
+    return $config if defined $config;
+
+    $config = q{};
+    if ( $ENV{KOHA_CONF} && open my $fh, '<', $ENV{KOHA_CONF} ) {
+        $config = do { local $/; <$fh> };
+        close $fh;
+    }
+    return $config;
+}
+
+=head2 bot_guard
+
+    my $guard = bot_guard();
+
+Koha's bot guard middleware set up from koha-conf.xml, when this Koha has one and it is on.
+
+=cut
+
+sub bot_guard {
+    my ($block) = koha_conf() =~ m{<opac_bot_guard>(.*?)</opac_bot_guard>}s or return;
+    return unless $block =~ m{<enabled>\s*1\s*</enabled>};
+
+    my $guard = eval {
+        require Koha::Middleware::BotGuard;
+        my $middleware = Koha::Middleware::BotGuard->new( { app => sub { } } );
+        $middleware->prepare_app;
+        $middleware;
+    } or return;
+    return $guard->enabled ? $guard : undef;
+}
+
+=head2 respond_psgi
+
+    respond_psgi($response);
+
+Prints a PSGI response as a CGI response and ends the process.
+
+=cut
+
+sub respond_psgi {
+    my ($response) = @_;
+    my ( $code, $headers, $body ) = @{$response};
+
+    require HTTP::Status;
+    my @lines = ( "Status: $code " . HTTP::Status::status_message($code) );
+    push @lines, "$headers->[ 2 * $_ ]: $headers->[ 2 * $_ + 1 ]" for 0 .. @{$headers} / 2 - 1;
+    binmode STDOUT;
+    print join( "\r\n", @lines, q{}, q{} ), @{$body};
+    exit 0;
 }
 
 =head2 too_many
